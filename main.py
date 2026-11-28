@@ -83,7 +83,7 @@ try:
                         HudButton, HudChart, HudFrame, HudNav, MetricTile, MicButton, PnlPanel, RISK_NOTE, StatusGrid,
                         TickerCard, apply_theme, esc, heading, get_currency, hex_of, hud_popup, inr, notice, px, rgba_of,
                         set_currency, set_price_format)
-    from agents import (AGENT_NAMES, BUY, MIN_AGREE, SELL, ConsensusEngine, TrailingStop, copilot_report, fx,
+    from agents import (AGENT_NAMES, AGREE_PCT, BUY, MIN_AGREE, SELL, ConsensusEngine, TrailingStop, copilot_report, fx,
                     set_price_dp)
     from broker import (AppLock, BrokerError, BrokerFeed, CredentialStore, IntegrityGuard, MarketStream, PaperBroker,
                         TickStream,
