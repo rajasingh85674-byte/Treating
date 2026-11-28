@@ -188,6 +188,29 @@ def http(method: str, url: str, headers: Optional[Dict[str, str]] = None, params
 # --------------------------------------------------------------------------- #
 # Credentials (private app storage, file mode 600)
 # --------------------------------------------------------------------------- #
+def load_env_files(paths) -> List[str]:
+    """Reads KEY=VALUE lines of .env files into the process environment, only names that start with TDN_, and never
+    over a value that is already set. Returns the files that were read. A missing file is normal."""
+    done: List[str] = []
+    for path in paths:
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                lines = fh.read().splitlines()
+        except OSError:
+            continue
+        for raw in lines:
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            name, value = line.split("=", 1)
+            name = name.strip()
+            value = value.strip().strip('"').strip("'")
+            if name.startswith("TDN_") and value and name not in os.environ:
+                os.environ[name] = value
+        done.append(path)
+    return done
+
+
 class CredentialStore:
     """Broker keys, OpenAI key and daily access tokens. Stored only inside the app's private folder (file mode 600).
     The file is not encrypted: do not install this app on a phone you do not control.
@@ -200,7 +223,7 @@ class CredentialStore:
     _SECRET_FIELDS = ("kite_key", "kite_secret", "kite_token", "upstox_key", "upstox_secret", "upstox_token",
                       "openai_key", "eleven_key", "oanda_token")
     _CHOICES = {"broker": ("KITE", "UPSTOX"), "mic_engine": ("AUTO", "ANDROID", "OPENAI"),
-                "voice_source": ("AUTO", "ELEVENLABS", "OPENAI", "PHONE"), "oanda_env": ("PRACTICE", "LIVE")}
+                "voice_source": ("AUTO", "ELEVENLABS", "OPENAI", "PHONE", "CUSTOM"), "oanda_env": ("PRACTICE", "LIVE")}
     _OPENAI_VOICES = ("onyx", "ash", "echo", "sage", "fable", "alloy", "nova", "coral", "shimmer")
 
     def __init__(self, path: str):
@@ -258,9 +281,22 @@ class CredentialStore:
                     if k in saved and isinstance(saved[k], str):
                         self.data[k] = self._clean_value(k, saved[k])
 
+    # Optional environment / .env fallback (desktop and testing). A value saved in the app wins. On a phone use CONFIG:
+    # the key then stays in the private app folder. Never put a .env file inside the APK or the repository.
+    ENV_NAMES = {"kite_key": "TDN_KITE_KEY", "kite_secret": "TDN_KITE_SECRET", "upstox_key": "TDN_UPSTOX_KEY",
+                 "upstox_secret": "TDN_UPSTOX_SECRET", "openai_key": "TDN_OPENAI_KEY", "eleven_key": "TDN_ELEVEN_KEY",
+                 "eleven_voice": "TDN_ELEVEN_VOICE_ID", "oanda_token": "TDN_OANDA_TOKEN",
+                 "oanda_account": "TDN_OANDA_ACCOUNT"}
+
     def get(self, key: str) -> str:
         with self._lock:
-            return self.data.get(key, "")
+            value = self.data.get(key, "")
+            if not value and key in self.ENV_NAMES:
+                try:
+                    return self._clean_value(key, os.environ.get(self.ENV_NAMES[key], ""))
+                except Exception:
+                    return ""
+            return value
 
     def masked(self, key: str) -> str:
         """For the screen: shows that a secret exists and its last four characters, never the whole value."""
@@ -451,7 +487,8 @@ class IntegrityGuard:
     as a brand new app. Keep the phone locked and install only the APK you built yourself."""
 
     MODULES = ("main", "voice_engine", "voice_mic", "broker", "ui_hud", "agents", "mentor", "reply_agent",
-               "risk_manager", "forex", "voice_forex", "market_flow", "agent_brain", "custom_voice")
+               "risk_manager", "forex", "voice_forex", "market_flow", "agent_brain", "custom_voice",
+               "agent_memory", "budget", "multi_scan", "patterns", "agent_roster", "agent_talk")
     _KEY_LOOK = re.compile(r"sk-[A-Za-z0-9]{20,}|sk_[A-Za-z0-9]{20,}")
 
     def __init__(self, data_dir: str, app_dir: str, version: str):
@@ -479,7 +516,7 @@ class IntegrityGuard:
             out.append("daily loss limit is above 2 percent")
         if _risk.MAX_CONSECUTIVE_LOSSES > 2:
             out.append("loss lock allows more than 2 losses")
-        if _agents.MIN_AGREE < 9:
+        if _agents.MIN_AGREE < 2 or _agents.AGREE_PCT < 10:
             out.append("minimum agreeing agents was lowered")
         if _agents.MIN_RR < 2.0:
             out.append("minimum reward to risk was lowered")

@@ -86,15 +86,21 @@ try:
                     set_price_dp)
     from broker import (AppLock, BrokerError, BrokerFeed, CredentialStore, IntegrityGuard, MarketStream, PaperBroker,
                         TickStream,
-                        YahooFeed, clean_secret, clean_text, ist_now, make_broker, redact)
+                        YahooFeed, clean_secret, clean_text, ist_now, load_env_files, make_broker, redact)
     from agent_brain import AgentBrain
+    from agent_memory import AgentMemory, KIND_LABELS as MEM_LABELS, KINDS as MEM_KINDS
+    from agent_roster import ALL_NAMES, role_of, row_for as roster_row, rows as roster_rows
+    from agent_talk import AgentTalk
+    from budget import Budget, TIER_CHARTS, TIER_INFO, TIERS
+    from multi_scan import (market_verdict, report as multi_scan_report, scan as multi_scan_run, win_history)
+    from patterns import analyze as pattern_analyze, paper_preview, report as pattern_report
     from market_flow import (FlowCollector, SIDE_CHOICES, bias_text, candle_bias, is_flow_request,
                              report as flow_report_text, side_allows, symbol_context)
     from forex import (FX_WATCHLIST, FxPaperBroker, NoTicks, OandaBroker, YahooFxFeed, fx_open, fx_slot, is_pair,
                        price_dp, session_text)
     from voice_forex import FxVoiceGate, parse_fx, readback
     from risk_manager import PaperLearner, RiskManager
-    from voice_engine import (OPENAI_VOICES, PROFILES, ChatAI, ElevenLabsClient, OpenAIClient, OpenAIError,
+    from voice_engine import (DEFAULT_ELEVEN_VOICE, OPENAI_VOICES, PROFILES, ChatAI, ElevenLabsClient, OpenAIClient, OpenAIError,
                               VoiceEngine)
     from voice_mic import HELP_TEXT, VoiceMic, is_command, parse_command
     from mentor import (CHOP, DISCIPLINE, GOOD, QUALITY_TEXT, RULES, best_of, no_hype, biodata, chop_check, drawing_guide, scan_row,
@@ -203,6 +209,7 @@ class TDNApp(App):
             return self._error_screen(BOOT_ERROR)
         self.data_dir = self.user_data_dir if platform == "android" else os.path.join(os.path.expanduser("~"), ".tdn")
         os.makedirs(self.data_dir, exist_ok=True)
+        load_env_files([os.path.join(self.data_dir, ".env"), os.path.join(os.getcwd(), ".env")])
         self.ui_path = os.path.join(self.data_dir, "ui.json")
         self.ui = {"theme": "TIGER HUD", "feed": "AUTO", "symbol": WATCHLIST[0], "anim": True, "speak_errors": False,
                    "market": "NSE", "fx_symbol": FX_WATCHLIST[0], "side": "AUTO"}
@@ -239,7 +246,7 @@ class TDNApp(App):
         self.note = ""
         self.funds = None
         self.busy = {"eval": False, "exits": False, "funds": False, "order": False, "panic": False, "chat": False,
-                     "reply": False, "scan": False}
+                     "reply": False, "scan": False, "talk": False}
         self.live_unlocked = False               # real orders are locked at every start until the user unlocks them
         self.mode = "PAPER"                      # PAPER or LIVE; the app always opens in PAPER
         self.app_locked = False                  # True while the PIN screen is up
@@ -327,6 +334,14 @@ class TDNApp(App):
         self.mic.prefer = self.store.get("mic_engine") or "AUTO"
         self.chat = ChatAI(self.openai)
         self.reply_agent = ReplyAgent(self.openai)
+        self.agent_memory = AgentMemory(self.data_dir)          # ADVANCED: independent memory of all 25 agents
+        self.budget = Budget(self.data_dir)                      # ADVANCED: budget tier and credit monitor
+        self.voice.budget = self.budget
+        self.talk = AgentTalk(self.openai, self.agent_memory, self.budget)
+        self.entry_votes = {}                                    # symbol -> {agent: vote} of the order in flight
+        self.last_votes = None
+        self.desk_agent = ALL_NAMES[0]
+        self.desk_tab = "memoryLog"
         self.ticks.set_symbol(self.symbol)
         self.ticks.start()
         self.collector = FlowCollector(self.brain, self._scan_feed, lambda: list(self.watchlist), lambda: self.market,
@@ -358,6 +373,11 @@ class TDNApp(App):
             try:
                 ctx = dict(trade.get("ctx") or {}) if isinstance(trade, dict) else {}
                 self.brain.record_trade(market, trade, ctx)
+            except Exception:
+                pass
+            try:
+                votes = getattr(self, "entry_votes", {}).get(str(trade.get("symbol", "")), {})
+                self.agent_memory.learn_from_trade(trade, votes)
             except Exception:
                 pass
         return hook
@@ -537,7 +557,7 @@ class TDNApp(App):
 
     def _header(self):
         box = HudFrame(accent=P["a2"], scan=True, padding=(dp(12), dp(8)), spacing=dp(2))
-        box.add_widget(AutoLabel(text="[b][color=%s]TACTICAL NEURAL MATRIX[/color][/b]  [color=%s]TDN | %s LIVE DATA[/color]"
+        box.add_widget(AutoLabel(text="[b][color=%s]TACTICAL NEURAL MATRIX[/color][/b]  [color=%s]ADVANCED | TDN | %s LIVE DATA[/color]"
                                  % (P["hx_a2"], P["hx_a1"], "FOREX" if self.market == "FX" else "NSE"), font_size=sp(14)))
         self.grid = StatusGrid(["FEED", "PRICE", "MARKET", "SYSTEM", "MODE", "BROKER", "TICKS", "GUARD", "LOCK"], cols=3)
         box.add_widget(self.grid)
@@ -671,7 +691,110 @@ class TDNApp(App):
             tile.bind(on_release=lambda inst, n=name: self.agent_touched(n))
             self.tiles[name] = tile
             col.add_widget(tile)
+        self._build_desk(col)
         return sv
+
+    def _build_desk(self, col):
+        """ADVANCED agent desk: all 25 agents, their status and live task, independent memory and Direct Talk."""
+        box = HudFrame(accent=P["a1"], scan=True)
+        box.add_widget(heading("ADVANCED AGENT DESK  |  25 AGENTS (20 VOTING + 5 SUPPORT)"))
+        self.lbl_roster = AutoLabel(text="", font_size=sp(11), color=P["muted"])
+        box.add_widget(self.lbl_roster)
+        self.sp_desk = Spinner(text=self.desk_agent, values=tuple(ALL_NAMES), size_hint_y=None, height=dp(44),
+                               font_size=sp(13), background_normal="", background_color=P["a1"],
+                               color=(0.01, 0.01, 0.02, 1))
+        self.sp_desk.bind(text=lambda inst, val: self._desk_pick(val))
+        box.add_widget(self.sp_desk)
+        self.lbl_desk_head = AutoLabel(text="", font_size=sp(12))
+        box.add_widget(self.lbl_desk_head)
+        row = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(44), spacing=dp(6))
+        for kind in ("memoryLog", "pastStory", "mistakesAndFixes"):
+            b = HudButton(text=MEM_LABELS[kind], accent=P["a2"], height=44)
+            b.font_size = sp(10)
+            b.bind(on_release=lambda inst, k=kind: self._desk_tab(k))
+            row.add_widget(b)
+        box.add_widget(row)
+        self.lbl_desk_mem = AutoLabel(text="", font_size=sp(12))
+        box.add_widget(self.lbl_desk_mem)
+        box.add_widget(heading("DIRECT TALK", P["a2"]))
+        self.lbl_desk_chat = AutoLabel(text="", font_size=sp(12))
+        box.add_widget(self.lbl_desk_chat)
+        self.in_desk = TextInput(text="", hint_text="message to the selected agent", multiline=False,
+                                 size_hint_y=None, height=dp(44), font_size=sp(13), background_color=P["panel"],
+                                 foreground_color=P["text"], hint_text_color=P["muted"], cursor_color=P["a1"],
+                                 padding=(dp(8), dp(12)))
+        self.in_desk.bind(on_text_validate=lambda inst: self._desk_send())
+        box.add_widget(self.in_desk)
+        send = HudButton(text="SEND TO AGENT", accent=P["a1"], filled=True, height=46)
+        send.bind(on_release=lambda inst: self._desk_send())
+        box.add_widget(send)
+        self.lbl_desk_note = AutoLabel(text="The agent only talks: it cannot place, arm or unlock anything. With an "
+                                            "OpenAI key saved in CONFIG it answers with the AI, otherwise from its "
+                                            "saved records.", font_size=sp(11), color=P["muted"])
+        box.add_widget(self.lbl_desk_note)
+        col.add_widget(box)
+        self._desk_refresh()
+
+    def _roster(self):
+        votes = self.last_votes if self.last_votes and self.decision_symbol_ok() else None
+        return roster_rows(votes, self._data_problem(), self.session_open(), self.market, self.source,
+                           self.agent_memory.describe(), self.budget.short(), self.voice.status()[:140],
+                           "%s %s" % (self.source, self.symbol))
+
+    def decision_symbol_ok(self):
+        d = self.engine.last_decision
+        return d is not None and d.symbol == self.symbol
+
+    def _desk_pick(self, name):
+        self.desk_agent = name
+        self._desk_refresh()
+
+    def _desk_tab(self, kind):
+        self.desk_tab = kind
+        self._desk_refresh()
+
+    def _desk_refresh(self):
+        try:
+            table = self._roster()
+            self.lbl_roster.text = esc("\n".join("%02d %s: %s" % (i + 1, r["name"], r["status"])
+                                                  for i, r in enumerate(table)))
+            r = roster_row(table, self.desk_agent) or {"role": "", "status": "", "task": "", "source": "", "kind": ""}
+            self.lbl_desk_head.text = esc("%s [%s]\nJob: %s\nStatus: %s\nLive task: %s\nSource: %s" % (
+                self.desk_agent, r["kind"], r["role"], r["status"], r["task"], r["source"]))
+            rows = self.agent_memory.recent(self.desk_agent, self.desk_tab, 8)
+            self.lbl_desk_mem.text = esc("%s (%d saved):\n%s" % (
+                MEM_LABELS[self.desk_tab], len(rows), "\n".join("- " + x["text"] for x in rows) or "Nothing saved yet."))
+            chat = list(reversed(self.agent_memory.recent(self.desk_agent, "chat", 6)))
+            self.lbl_desk_chat.text = esc("\n".join(x["text"] for x in chat) or "No messages yet.")
+        except Exception as exc:
+            self.report_exception("AGENTS", exc)
+
+    def _desk_send(self):
+        text = self.in_desk.text
+        if self.busy["talk"]:
+            return self.status("The agent is still answering.")
+        if not clean_text(text, 20):
+            return self.status("Write a message to the agent first.")
+        self.in_desk.text = ""
+        self.busy["talk"] = True
+        self.lbl_desk_note.text = "Asking %s ..." % self.desk_agent
+        table = self._roster()
+        r = roster_row(table, self.desk_agent) or {"role": role_of(self.desk_agent), "status": "", "task": ""}
+        threading.Thread(target=self._desk_worker, args=(self.desk_agent, r["role"], r["status"], r["task"], text),
+                         daemon=True).start()
+
+    def _desk_worker(self, agent, role, status, task, text):
+        try:
+            answer, source = self.talk.reply(agent, role, status, task, text)
+        except Exception as exc:
+            answer, source = "Talk error: %s" % redact(str(exc))[:100], "ERROR"
+            self.report_exception("AGENTS", exc)
+        self.busy["talk"] = False
+
+        def apply(dt):
+            self.lbl_desk_note.text = esc("Answer source: %s | %s" % (source, self.budget.short()))
+            self._desk_refresh()
+        Clock.schedule_once(apply, 0)
 
     # ---- DEPTH screen ----
     def _screen_depth(self):
@@ -994,6 +1117,30 @@ class TDNApp(App):
         body.add_widget(b_clear)
         body.add_widget(lbl_brain)
 
+        title("BUDGET AND CREDIT MONITOR (ADVANCED)")
+        body.add_widget(AutoLabel(text="The tier sets how much AI chat, cloud voice and multi-chart scanning this app may "
+                                       "use per day. It does not buy credits. Your real OpenAI / ElevenLabs balance "
+                                       "cannot be read here: check it in your provider account.",
+                                  font_size=sp(12), color=P["muted"]))
+        lbl_bud = AutoLabel(text="", font_size=sp(12), color=P["muted"])
+        bud_busy = [False]
+
+        def bud_text():
+            return esc(self.budget.summary() + "\n" + self.agent_memory.describe())
+
+        def pick_tier(val):
+            if bud_busy[0]:
+                return
+            if self.budget.set_tier(val):
+                self.status("Budget tier: %s" % val)
+            lbl_bud.text = bud_text()
+        tier_spin = spinner(TIERS, self.budget.tier, pick_tier)
+        lbl_bud.text = bud_text()
+        body.add_widget(lbl_bud)
+        bb = HudButton(text="REFRESH BUDGET STATUS", accent=P["a1"], height=44)
+        bb.bind(on_release=lambda inst: setattr(lbl_bud, "text", bud_text()))
+        body.add_widget(bb)
+
         title("VOICE PROFILE")
         labels = {label: key for key, label in self.voice.profiles()}
         current = PROFILES[self.voice.profile]["label"]
@@ -1254,7 +1401,7 @@ class TDNApp(App):
             self.store.reload()
             key = self.store.masked("eleven_key") or "none saved"
             voice = self.store.get("eleven_voice")
-            return "ElevenLabs key: %s. Voice ID: %s." % (key, (voice[:6] + "..." + voice[-3:]) if len(voice) > 10 else (voice or "none saved"))
+            return "ElevenLabs key: %s. Voice ID: %s." % (key, (voice[:6] + "..." + voice[-3:]) if len(voice) > 10 else (voice or "default " + DEFAULT_ELEVEN_VOICE[:6] + "..."))
 
         def save_el():
             key = clean_secret(f_el_key.text)
@@ -1320,6 +1467,10 @@ class TDNApp(App):
             cv_mode_spin.text = MODE_LABELS[cv.mode]
             cv_refreshing[0] = False
             cv_show()
+            bud_busy[0] = True
+            tier_spin.text = self.budget.tier
+            bud_busy[0] = False
+            lbl_bud.text = bud_text()
         self.config_refresh = refresh
         refresh()
         nb = HudButton(text="NEXT SYMBOL", accent=P["a1"], height=46)
@@ -1342,7 +1493,7 @@ class TDNApp(App):
         body.add_widget(elog)
 
         title("SAFETY RULES (fixed)")
-        body.add_widget(AutoLabel(text="1% maximum risk per trade. At least 9 of 20 agents must agree, reward:risk at "
+        body.add_widget(AutoLabel(text="1% maximum risk per trade. At least 10 percent of the 20 voting agents (2) must agree, with no veto and no strong opposition, reward:risk at "
                                        "least 1:2, no trade on weak volume or traps. Maximum 2% loss per day. Two losses in "
                                        "a row lock the day. Trailing stop only ever tightens. NSE positions are closed at "
                                        "15:15 India time, forex positions before the weekend. Spoken commands only request a "
@@ -1681,6 +1832,8 @@ class TDNApp(App):
         return out
 
     def _refresh_all(self):
+        if self.screen_name == "agents" and hasattr(self, "lbl_roster"):
+            self._desk_refresh()
         st = self.risk.status()
         ti = self.tick_info()
         if self.tamper:
@@ -1837,6 +1990,7 @@ class TDNApp(App):
         if d.symbol != self.symbol:
             return
         self.decision = d
+        self.last_votes = list(d.votes)
         for v in d.votes:
             tile = self.tiles.get(v.agent)
             if tile is None:
@@ -2420,6 +2574,10 @@ class TDNApp(App):
         if why:
             return self.alert(why)
         self.busy["order"] = True
+        try:
+            self.entry_votes[d.symbol] = {v.agent: v.signal for v in d.votes}
+        except Exception:
+            pass
         self.status("Sending %s order to %s ..." % (self.mode, self.broker.name))
         threading.Thread(target=self._order_worker, args=(d, self.price, risk_pct), daemon=True).start()
 
@@ -3027,6 +3185,18 @@ class TDNApp(App):
         row.add_widget(self.btn_view_red)
         top.add_widget(row)
         col.add_widget(top)
+        adv = HudFrame(accent=P["a1"], scan=True)
+        adv.add_widget(heading("ADVANCED: MULTI-CHART SCAN + BULLISH / BEARISH PATTERNS"))
+        adv.add_widget(AutoLabel(text="Reads the symbol on the HUD from real candles: 1m, 3m, 5m, 15m, 1h and the day, "
+                                      "with a confluence score, then lists bullish and bearish patterns separately. "
+                                      "Which charts are read depends on your budget tier. It never places an order.",
+                                 font_size=sp(11), color=P["muted"]))
+        run = HudButton(text="RUN MULTI-CHART SCAN", accent=P["a1"], filled=True, height=48)
+        run.bind(on_release=lambda inst: self.run_multi_scan())
+        adv.add_widget(run)
+        self.lbl_ms = AutoLabel(text="Tap RUN MULTI-CHART SCAN.", font_size=sp(12))
+        adv.add_widget(self.lbl_ms)
+        col.add_widget(adv)
         self._build_scan_view("green")
         self._build_scan_view("red")
         self.scan_holder = BoxLayout(orientation="vertical", size_hint_y=None)
@@ -3051,6 +3221,37 @@ class TDNApp(App):
         col.add_widget(mn)
         self.set_scan_view(self.scan_view)
         return sv
+
+    def run_multi_scan(self):
+        """Multi-chart confluence + bullish and bearish pattern analysis + PAPER preview numbers. Read-only."""
+        problem = self._data_problem()
+        if problem or not self.candles:
+            self.lbl_ms.text = "[color=%s]NO LIVE DATA[/color]  %s" % (P["hx_danger"], esc(problem or "No candles yet."))
+            return
+        allowed, why = self.budget.allow("scan")
+        if not allowed:
+            self.lbl_ms.text = esc("Scan not run: %s." % why)
+            return
+        res = multi_scan_run(self.candles, allowed=TIER_CHARTS[self.budget.tier])
+        pat = pattern_analyze(self.candles)
+        text = "%s %s\n%s\n\n%s" % (self.symbol, self.market, multi_scan_report(res), pattern_report(pat))
+        d = self.engine.last_decision if self.decision_symbol_ok() else None
+        try:
+            history = win_history(self.brain.trades(self.market, 200))
+        except Exception:
+            history = win_history([])
+        text += "\n\n" + market_verdict(res, pat, problem, self.session_open(), d, history)
+        if res and pat and res["direction"] in ("BULLISH", "BEARISH") and res["direction"] == pat["lean"]:
+            pv = paper_preview(self.candles, pat["lean"], self.equity(), self.cash(), self.engine.sizer, self.symbol)
+            if pv and pv["qty"] >= 1:
+                text += "\n\nPAPER PREVIEW %s: entry %s, stop %s, target %s, qty %d, money at risk %s. %s" % (
+                    pv["side"], px(pv["entry"]), px(pv["sl"]), px(pv["tp"]), pv["qty"], inr(pv["risk_amount"]),
+                    pv["note"])
+            else:
+                text += "\n\nNo paper preview: capital is too small for the 1% risk rule on this setup."
+        elif res and pat:
+            text += "\n\nNo paper preview: the charts (%s) and the patterns (%s) do not agree." % (res["direction"], pat["lean"])
+        self.lbl_ms.text = esc(text)
 
     def _screen_reply(self):
         sv, col = scroll_column(spacing=8)
@@ -3210,6 +3411,7 @@ class TDNApp(App):
         for fn in (getattr(self, "stream", None) and self.stream.stop, getattr(self, "ticks", None) and self.ticks.stop,
                    getattr(self, "collector", None) and self.collector.stop,
                    getattr(self, "brain", None) and self.brain.close,
+                   getattr(self, "agent_memory", None) and self.agent_memory.close,
                    ANIM.stop, getattr(self, "mic", None) and self.mic.shutdown):
             try:
                 if fn:

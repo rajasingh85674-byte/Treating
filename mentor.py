@@ -231,7 +231,7 @@ def trade_guidance(decision, risk_status: Optional[Dict] = None, choppy: bool = 
         reasons.append("No scan yet. Tap SCAN NOW.")
     elif not decision.approved:
         reasons.append("Only %d of %d agents agree (need %d). %s" % (
-            decision.agree, decision.total, getattr(decision, "need", 9), decision.reason))
+            decision.agree, decision.total, getattr(decision, "need", 2), decision.reason))
     if choppy:
         reasons.append("The market is choppy.")
     if reasons:

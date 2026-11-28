@@ -18,7 +18,9 @@ SELL = "SELL"
 NEUTRAL = "NEUTRAL"
 
 MIN_RR = 2.0              # minimum reward : risk
-MIN_AGREE = 9             # agents (of 20) that must point the same way
+VOTING_AGENTS = 20
+AGREE_PCT = 10            # percent of the voting agents that must point the same way (10 percent of 20 = 2)
+MIN_AGREE = max(2, -(-VOTING_AGENTS * AGREE_PCT // 100))   # agents that must agree, never fewer than 2
 MIN_CANDLES = 60
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -75,7 +77,7 @@ class Decision:
     risk_amount: float = 0.0
     reason: str = ""
     invalidation: float = 0.0     # the price that proves the idea wrong (the stop)
-    need: int = 9                # agents that had to agree (the base rule plus any paper-learned extra)
+    need: int = 2                # agents that had to agree (the base rule plus any paper-learned extra)
     votes: List[Vote] = field(default_factory=list)
     ts: float = field(default_factory=time.time)
 

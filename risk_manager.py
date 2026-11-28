@@ -325,7 +325,7 @@ class PaperLearner:
 
     Each closed trade is filed under a setup key (direction | market quality | time of day) with its result in
     R (profit or loss divided by the money risked). Once a setup has MIN_TRADES results, a bad record raises the
-    number of agents that must agree (base 9 of 20) by up to +3, so weak setups need more proof. A good record
+    number of agents that must agree (base 10 percent of the 20 voting agents, 2) by up to +3, so weak setups need more proof. A good record
     simply returns to the base rule. Nothing here can raise the 1% risk, the 2% daily limit or the 2-loss lock,
     can remove a stop-loss, or can lower the base agent count. With few trades the numbers are noise, so the
     notes always say how many trades they are based on."""

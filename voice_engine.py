@@ -55,6 +55,7 @@ PROFILES: Dict[str, Dict] = {
 }
 DEFAULT_PROFILE = "JARVIS"
 
+DEFAULT_ELEVEN_VOICE = "iWNf11sz1GrUE4ppxTOL"
 VOICE_SOURCES = ("AUTO", "ELEVENLABS", "OPENAI", "PHONE", "CUSTOM")
 # OpenAI voice name -> how it sounds. The first ones are the deep ones.
 OPENAI_VOICES: Dict[str, str] = {
@@ -331,7 +332,8 @@ class ElevenLabsClient:
             v = (self._voice_getter() or "").strip()
         except Exception:
             v = ""
-        return "".join(ch for ch in v if ch.isascii() and ch.isalnum())[:40]    # voice IDs are letters and digits
+        v = "".join(ch for ch in v if ch.isascii() and ch.isalnum())[:40]       # voice IDs are letters and digits
+        return v or DEFAULT_ELEVEN_VOICE                                        # a voice ID is public, not a secret
 
     def ready(self) -> bool:
         return len(self.key()) >= 16 and len(self.voice_id()) >= 10
@@ -463,6 +465,7 @@ class VoiceEngine:
         self._retries = 0
         self._next_retry = 0.0
         self.problem = ""                    # last speech problem, shown in CONFIG
+        self.budget = None                   # budget.Budget: daily allowance for cloud voice (set by the app)
         self.custom_on = False               # use the custom phone-voice profile (language, pitch, speed)
         self.custom_tag = ""
         self.custom_pitch = 1.0
@@ -876,18 +879,28 @@ class VoiceEngine:
         for name in self.provider_names():
             if time.time() < self._pause.get(name, 0.0):
                 continue
+            budget = getattr(self, "budget", None)
+            if budget is not None:
+                allowed, why = budget.allow("cloud_voice", len(msg))
+                if not allowed:
+                    notice = notice or ("Cloud voice skipped: %s. I am using the phone voice." % why)
+                    continue
             try:
                 audio, label = self._synth(name, msg)
                 self._halt.clear()
                 if not self._play_mp3(audio):
                     raise OpenAIError("the audio could not be played on this phone", 0)
             except OpenAIError as exc:               # ElevenLabsError is a subclass
+                if budget is not None:
+                    budget.record_problem("cloud_voice", budget.kind_of("%d %s" % (exc.status, exc)))
                 notice = self._cloud_failed(name, exc.status, str(exc)) or notice
                 continue
             except Exception as exc:
                 notice = self._cloud_failed(name, 0 if "connect" in str(exc).lower() else 1, str(exc)[:90]) or notice
                 continue
             self.last_used = label
+            if budget is not None:
+                budget.record_ok("cloud_voice")
             if name in self._failed:
                 del self._failed[name]
                 self._log("%s voice is working again." % self.LABELS[name])
