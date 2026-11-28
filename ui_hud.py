@@ -1,17 +1,23 @@
 # -*- coding: utf-8 -*-
-"""ui_hud.py - sci-fi camera-viewfinder HUD widgets and the theme engine for Tactical Neural Matrix.
+"""ui_hud.py - widgets and theme of Tactical Neural Matrix, drawn to the NAVY TERMINAL design (dark navy / black,
+soft gradients, thin blue-grey borders, rounded cards, green / red / amber / blue badges).
 
 Everything is drawn with Kivy canvas instructions (no image files):
-  * HudFrame     - glowing panel with corner brackets, a faint status grid and an optional scan line
-  * HudButton    - terminal button with bracket corners; HoldButton needs a 0.9 s press (panic actions)
-  * MicButton    - large push-to-talk button with crosshairs, tick ring and pulse / radar animation
-  * HudChart     - live 1-minute candles with crosshair, reticle ring, edge ticks and level lines
-  * AgentTile    - tappable agent card
-  * StatusGrid   - small key/value cells for the header
-  * HudNav       - bottom navigation bar
-  * PnlPanel     - ledger (PAPER virtual money or LIVE real money): balance, winnings, losses, net P&L
-  * RISK_NOTE    - the one-line discipline reminder shown on the HUD
-All animation runs from ONE shared 15 frames-per-second timer (ANIM) which can be switched off to save battery.
+  * HudFrame     - card ("panel"): vertical gradient, thin border, rounded corners
+  * Heading      - card title: small capitals with a thin rule underneath
+  * HudButton    - primary (blue gradient), secondary (dark) and danger (dark red) buttons; HoldButton needs a 0.9 s press
+  * NavButton / HudNav - bottom bar with six tabs, the active tab is highlighted
+  * Badge / BadgeRow   - small outlined status badges (DISARMED, PAPER MODE, LIVE LOCKED, NO LIVE DATA ...)
+  * TickerCard   - label, price and change of one instrument, or NO LIVE DATA
+  * MetricTile   - big number with a small caption (1% risk, 2% loss limit)
+  * MicButton    - push-to-talk button
+  * HudChart     - live candles on a grid with a LIVE / NO LIVE DATA chip
+  * AgentTile    - one row of the agent list (status dot, name, job, state)
+  * StatusGrid   - small key/value cells
+  * PnlPanel     - ledger (PAPER virtual money or LIVE real money)
+  * hud_popup    - dialog card with the same look
+Only real values are drawn here: when there is nothing to show the widgets say NO LIVE DATA.
+One shared 15 frames-per-second timer (ANIM) drives the few small animations and can be switched off to save battery.
 """
 import math
 import time
@@ -19,7 +25,10 @@ import weakref
 
 from kivy.clock import Clock
 from kivy.core.text import Label as CoreLabel
-from kivy.graphics import Color, Line, Rectangle, RoundedRectangle
+from kivy.graphics import Color, Line, Ellipse, Rectangle, RoundedRectangle
+from kivy.graphics.texture import Texture
+from kivy.uix.popup import Popup
+from kivy.uix.stacklayout import StackLayout
 from kivy.metrics import dp, sp
 from kivy.uix.behaviors import ButtonBehavior
 from kivy.uix.boxlayout import BoxLayout
@@ -32,15 +41,12 @@ from kivy.uix.widget import Widget
 # Theme engine
 # --------------------------------------------------------------------------- #
 THEMES = {
-    "TIGER HUD": {"bg": "#010103", "panel": "#070A10", "a1": "#00E5FF", "a2": "#FF8800", "up": "#00E5FF",
-                  "down": "#FF8800", "text": "#EAF6FF", "muted": "#7F94A8", "danger": "#FF3B47", "ok": "#2BFF88"},
-    "AMBER RECON": {"bg": "#030201", "panel": "#0E0903", "a1": "#FF8800", "a2": "#FFC24A", "up": "#FFC24A",
-                    "down": "#FF5A1F", "text": "#FFF1DC", "muted": "#9A8266", "danger": "#FF3B47", "ok": "#FFC24A"},
-    "ICE VISOR": {"bg": "#010305", "panel": "#06101A", "a1": "#00E5FF", "a2": "#7AB8FF", "up": "#00E5FF",
-                  "down": "#7A8CFF", "text": "#E8F8FF", "muted": "#6E8EA3", "danger": "#FF3B47", "ok": "#00E5FF"},
-    "NIGHT GREEN": {"bg": "#010301", "panel": "#06110A", "a1": "#2BFF88", "a2": "#FF8800", "up": "#2BFF88",
-                    "down": "#FF3B47", "text": "#E6FFF0", "muted": "#6D9A7F", "danger": "#FF3B47", "ok": "#2BFF88"},
+    "NAVY TERMINAL": {"bg": "#050a12", "panel": "#0b1421", "a1": "#39a7ff", "a2": "#39d9e8", "up": "#00d68f",
+                      "down": "#ff5368", "text": "#e7f0fb", "muted": "#8fa4bb", "danger": "#ff5368", "ok": "#00d68f",
+                      "surface2": "#101e30", "line": "#243950", "amber": "#ffc45c", "blue": "#39a7ff",
+                      "cyan": "#39d9e8", "purple": "#a879ff"},
 }
+DEFAULT_THEME = "NAVY TERMINAL"
 THEME_NAMES = list(THEMES.keys())
 P = {}
 
@@ -52,13 +58,13 @@ def _rgba(h, a=1.0):
 
 def apply_theme(name):
     """Switch the whole palette. Widgets read P when they are built or redrawn."""
-    theme = THEMES.get(name, THEMES["TIGER HUD"])
+    theme = THEMES.get(name, THEMES[DEFAULT_THEME])
     for key, value in theme.items():
         P[key] = _rgba(value)
         P["hx_" + key] = value.lstrip("#").lower()
 
 
-apply_theme("TIGER HUD")
+apply_theme(DEFAULT_THEME)
 
 
 def rgba(key, alpha=1.0):
@@ -251,18 +257,58 @@ RISK_NOTE = ("Discipline: trend, reward to risk and the invalidation level come 
              "promises. Any trade can lose money.")
 
 
+_GRAD_CACHE = {}
+
+
+def vgrad(top, bottom):
+    """A 1 x 2 texture with a smooth vertical gradient (top and bottom are (r, g, b) in 0..1). Cached."""
+    key = (tuple(round(v, 3) for v in top[:3]), tuple(round(v, 3) for v in bottom[:3]))
+    tex = _GRAD_CACHE.get(key)
+    if tex is None:
+        tex = Texture.create(size=(1, 2), colorfmt="rgba")
+        row = lambda c: bytes(int(max(0.0, min(1.0, v)) * 255) for v in (c[0], c[1], c[2])) + b"\xff"
+        tex.blit_buffer(row(bottom) + row(top), colorfmt="rgba", bufferfmt="ubyte")
+        tex.mag_filter = "linear"
+        tex.min_filter = "linear"
+        _GRAD_CACHE[key] = tex
+    return tex
+
+
+def _mix(a, b, t):
+    return tuple(a[i] + (b[i] - a[i]) * t for i in range(3))
+
+
+class Heading(AutoLabel):
+    """Card title: small bold capitals and a thin rule underneath."""
+
+    def __init__(self, text="", **kw):
+        kw.setdefault("font_size", sp(12))
+        kw.setdefault("color", rgba_of("#dce9f8"))
+        super().__init__(text=text, **kw)
+        self.bind(pos=self._rule, size=self._rule)
+
+    def _fit(self, *_):
+        self.height = self.texture_size[1] + dp(16)
+
+    def _rule(self, *_):
+        self.canvas.after.clear()
+        with self.canvas.after:
+            Color(*rgba_of("#263b52"))
+            Line(points=[self.x, self.y + dp(5), self.right, self.y + dp(5)], width=1)
+
+
 def heading(text, accent=None):
-    return AutoLabel(text="[b][color=%s]%s[/color][/b]" % (hex_of(accent or P["a1"]), text), font_size=sp(12))
+    return Heading(text="[b]%s[/b]" % str(text).upper())
 
 
 class HudFrame(BoxLayout):
-    """Dark panel with viewfinder corner brackets, a faint status grid and (optionally) a sweeping scan line.
-    Its height follows its content unless fixed=True."""
+    """Card: vertical gradient, thin blue-grey border, rounded corners. Its height follows its content unless
+    fixed=True. accent and scan are accepted for older callers; the NAVY TERMINAL design has no accent edge."""
 
     def __init__(self, accent=None, scan=False, fixed=False, **kw):
         kw.setdefault("orientation", "vertical")
-        kw.setdefault("padding", dp(12))
-        kw.setdefault("spacing", dp(4))
+        kw.setdefault("padding", dp(14))
+        kw.setdefault("spacing", dp(5))
         if not fixed:
             kw.setdefault("size_hint_y", None)
         super().__init__(**kw)
@@ -277,49 +323,25 @@ class HudFrame(BoxLayout):
         self.canvas.before.clear()
         x, y, w, h = self.x, self.y, self.width, self.height
         with self.canvas.before:
-            Color(*P["panel"])
-            Rectangle(pos=self.pos, size=self.size)
-            Color(self.accent[0], self.accent[1], self.accent[2], 0.045)
-            step = dp(22)
-            gx = x + step
-            while gx < x + w:
-                Line(points=[gx, y, gx, y + h], width=1)
-                gx += step
-            gy = y + step
-            while gy < y + h:
-                Line(points=[x, gy, x + w, gy], width=1)
-                gy += step
-            for grow, alpha in ((dp(3), 0.05), (dp(1.5), 0.10)):
-                Color(self.accent[0], self.accent[1], self.accent[2], alpha)
-                Line(rectangle=(x - grow, y - grow, w + 2 * grow, h + 2 * grow), width=grow)
-            Color(self.accent[0], self.accent[1], self.accent[2], 0.35)
-            Line(rectangle=(x, y, w, h), width=1)
-        self._draw_dynamic(ANIM.phase)
-
-    def _draw_dynamic(self, phase):
-        self.canvas.after.clear()
-        x, y, w, h = self.x, self.y, self.width, self.height
-        pulse = 0.75 + 0.25 * math.sin(phase * 3.0)
-        with self.canvas.after:
-            Color(self.accent[0], self.accent[1], self.accent[2], pulse)
-            draw_brackets(x, y, w, h, dp(16), dp(1.8))
-            alt = P["a2"] if self.accent == P["a1"] else P["a1"]
-            Color(alt[0], alt[1], alt[2], 0.9)
-            Line(points=[x + w - dp(34), y + h, x + w - dp(10), y + h], width=dp(1.8))
-            if self.scan and ANIM.enabled:
-                sy = y + ((phase * 0.18) % 1.0) * h
-                Color(self.accent[0], self.accent[1], self.accent[2], 0.16)
-                Line(points=[x + dp(2), sy, x + w - dp(2), sy], width=dp(1.4))
+            Color(1, 1, 1, 1)
+            RoundedRectangle(pos=(x, y), size=(w, h), radius=[dp(7)],
+                             texture=vgrad(rgba_of("#0d1928"), rgba_of("#09121e")))
+            Color(*rgba_of("#2a4058"))
+            Line(rounded_rectangle=(x, y, w, h, dp(7)), width=1)
+            Color(1, 1, 1, 0.035)
+            Line(points=[x + dp(8), y + h - 1, x + w - dp(8), y + h - 1], width=1)
 
     def on_phase(self, phase):
-        self._draw_dynamic(phase)
+        pass
 
 
 # --------------------------------------------------------------------------- #
 # Buttons
 # --------------------------------------------------------------------------- #
 class HudButton(Button):
-    """Terminal button: dark body, bracket corners, glowing border. filled=True gives a solid accent body."""
+    """Button in three looks. A filled button in the blue accent is the PRIMARY button (blue gradient). A danger-colour
+    button is the DANGER button (dark red). Every other button is SECONDARY (dark, thin border); its text takes the
+    accent colour when the accent carries meaning (green armed, muted locked)."""
 
     wrap = True                  # False: one line only, see NavButton
 
@@ -348,30 +370,53 @@ class HudButton(Button):
         self._apply_text_color()
         self._draw()
 
+    def _kind(self):
+        a = tuple(self.accent)[:3]
+        if a == tuple(P["danger"])[:3] or a == tuple(P["down"])[:3]:
+            return "danger"
+        if self.filled and a in (tuple(P["a1"])[:3], tuple(P["a2"])[:3], tuple(P["amber"])[:3]):
+            return "primary"
+        if self.filled:
+            return "solid"
+        return "secondary"
+
     def _apply_text_color(self):
-        self.color = (0.01, 0.01, 0.02, 1) if self.filled else self.accent
+        kind = self._kind()
+        if kind == "primary" or kind == "solid":
+            self.color = (1, 1, 1, 1)
+        elif kind == "danger":
+            self.color = rgba_of("#ffdce0")
+        else:
+            a = tuple(self.accent)[:3]
+            neutral = a in (tuple(P["a1"])[:3], tuple(P["a2"])[:3])
+            self.color = P["text"] if neutral else self.accent
 
     def _draw(self, *_):
         self.canvas.before.clear()
         x, y, w, h = self.x, self.y, self.width, self.height
         down = self.state == "down"
-        a = self.accent
+        kind = self._kind()
+        r = dp(4)
         with self.canvas.before:
-            if self.filled:
-                Color(a[0], a[1], a[2], 0.95 if not down else 0.70)
+            Color(1, 1, 1, 1)
+            if kind == "primary":
+                top, bot, edge = ("#167dc1", "#10558b", "#3b9ee2") if not down else ("#10558b", "#0c4670", "#3b9ee2")
+                RoundedRectangle(pos=(x, y), size=(w, h), radius=[r], texture=vgrad(rgba_of(top), rgba_of(bot)))
+                Color(*rgba_of(edge))
+            elif kind == "solid":
+                a = tuple(self.accent)[:3]
+                top, bot = _mix(a, (0, 0, 0), 0.20 if not down else 0.45), _mix(a, (0, 0, 0), 0.50 if not down else 0.62)
+                RoundedRectangle(pos=(x, y), size=(w, h), radius=[r], texture=vgrad(top, bot))
+                Color(*_mix(a, (1, 1, 1), 0.12), 1)
+            elif kind == "danger":
+                Color(*rgba_of("#51232c" if not down else "#6a2d38"))
+                RoundedRectangle(pos=(x, y), size=(w, h), radius=[r])
+                Color(*rgba_of("#85424e"))
             else:
-                Color(a[0], a[1], a[2], 0.07 if not down else 0.28)
-            Rectangle(pos=(x, y), size=(w, h))
-            for grow, alpha in ((dp(2.5), 0.07), (dp(1.2), 0.15)):
-                Color(a[0], a[1], a[2], alpha)
-                Line(rectangle=(x - grow, y - grow, w + 2 * grow, h + 2 * grow), width=grow)
-            Color(a[0], a[1], a[2], 0.85)
-            Line(rectangle=(x, y, w, h), width=1)
-            Color(1, 1, 1, 0.9 if self.filled else 0.0)
-            draw_brackets(x + dp(2), y + dp(2), w - dp(4), h - dp(4), dp(8), 1.4)
-            if not self.filled:
-                Color(a[0], a[1], a[2], 1)
-                draw_brackets(x, y, w, h, dp(10), dp(1.8))
+                Color(*rgba_of("#101f31" if not down else "#173654"))
+                RoundedRectangle(pos=(x, y), size=(w, h), radius=[r])
+                Color(*rgba_of("#38516d"))
+            Line(rounded_rectangle=(x, y, w, h, r), width=1)
 
 
 class HoldButton(HudButton):
@@ -430,17 +475,39 @@ class HoldButton(HudButton):
 
 class NavButton(HudButton):
     """Bottom menu tab. The label always stays on ONE line: it is never wrapped, and the font shrinks a little
-    when the phone is narrow, so AGENTS never turns into AGENT / S."""
+    when the phone is narrow, so AGENTS never turns into AGENT / S. The active tab is highlighted."""
     wrap = False
-    BASE = 12.5
+    BASE = 11.5
     SMALLEST = 7.0
 
     def __init__(self, **kw):
+        self.active = bool(kw.get("filled", False))
         super().__init__(**kw)
         self.text_size = (None, None)
         self.halign = "center"
         self.bind(width=self._fit, text=self._fit)
         Clock.schedule_once(self._fit, 0)
+
+    def set_active(self, on):
+        self.active = bool(on)
+        self._apply_text_color()
+        self._draw()
+
+    def _apply_text_color(self):
+        self.color = (1, 1, 1, 1) if getattr(self, "active", False) else rgba_of("#94a6bc")
+
+    def _draw(self, *_):
+        self.canvas.before.clear()
+        x, y, w, h = self.x, self.y, self.width, self.height
+        with self.canvas.before:
+            if getattr(self, "active", False):
+                Color(*rgba_of("#112b43"))
+                RoundedRectangle(pos=(x, y), size=(w, h), radius=[dp(4)])
+                Color(*rgba_of("#2f80b7"))
+                Line(rounded_rectangle=(x, y, w, h, dp(4)), width=1)
+            elif self.state == "down":
+                Color(*rgba_of("#0c1d2e"))
+                RoundedRectangle(pos=(x, y), size=(w, h), radius=[dp(4)])
 
     def _fit(self, *_):
         avail = max(self.width - dp(8), 1)
@@ -457,24 +524,160 @@ class NavButton(HudButton):
 
 
 class HudNav(BoxLayout):
-    """Bottom navigation: one HudButton per screen. The active one is filled."""
+    """Bottom navigation bar: dark strip with a thin top border and one tab per screen."""
 
     def __init__(self, items, on_select, current, **kw):
         kw.setdefault("orientation", "horizontal")
         kw.setdefault("size_hint_y", None)
         kw.setdefault("spacing", dp(4))
+        kw.setdefault("padding", (dp(6), dp(6)))
         super().__init__(**kw)
-        self.height = dp(44)
+        self.height = dp(54)
         self.buttons = {}
         for key, label in items:
-            b = NavButton(text=label, accent=P["a1"], filled=(key == current), height=44)
+            b = NavButton(text=label, accent=P["a1"], filled=(key == current), height=42)
             b.bind(on_release=lambda inst, k=key: on_select(k))
             self.buttons[key] = b
             self.add_widget(b)
+        self.bind(pos=self._bar, size=self._bar)
+
+    def _bar(self, *_):
+        self.canvas.before.clear()
+        with self.canvas.before:
+            Color(*rgba_of("#060d17", 0.96))
+            Rectangle(pos=self.pos, size=self.size)
+            Color(*rgba_of("#29415c"))
+            Line(points=[self.x, self.top, self.right, self.top], width=1)
 
     def select(self, current):
         for key, b in self.buttons.items():
-            b.set_accent(P["a2"] if key == current else P["a1"], filled=(key == current))
+            b.set_active(key == current)
+
+
+# --------------------------------------------------------------------------- #
+# Badges, tickers, metric tiles, dialogs
+# --------------------------------------------------------------------------- #
+BADGE_TONES = {"green": ("#00d68f", "#28654f"), "red": ("#ff5368", "#70404a"), "amber": ("#ffc45c", "#6a5835"),
+               "blue": ("#39a7ff", "#365c80"), "muted": ("#8fa4bb", "#243950")}
+
+
+class Badge(Label):
+    """Small outlined status badge, for example DISARMED (green), PAPER MODE (blue), LIVE LOCKED (red)."""
+
+    def __init__(self, text="", tone="muted", dot=False, **kw):
+        kw.setdefault("size_hint", (None, None))
+        super().__init__(text="", markup=True, bold=True, font_size=sp(10), **kw)
+        self.dot = dot
+        self.tone = "muted"
+        self.set(text, tone)
+        self.bind(pos=self._draw, size=self._draw)
+
+    def set(self, text, tone=None):
+        if tone in BADGE_TONES:
+            self.tone = tone
+        self.color = rgba_of(BADGE_TONES[self.tone][0])
+        self.text = esc(str(text).upper())
+        self.texture_update()
+        tw, th = self.texture_size
+        self.size = (tw + dp(18) + (dp(12) if self.dot else 0), max(th, dp(12)) + dp(10))
+        self.padding_x = 0
+        self._draw()
+
+    def _draw(self, *_):
+        self.canvas.before.clear()
+        text_col, edge = BADGE_TONES[self.tone]
+        with self.canvas.before:
+            Color(*rgba_of("#0a1320"))
+            RoundedRectangle(pos=self.pos, size=self.size, radius=[dp(4)])
+            Color(*rgba_of(edge))
+            Line(rounded_rectangle=(self.x, self.y, self.width, self.height, dp(4)), width=1)
+            if self.dot:
+                Color(*rgba_of(text_col))
+                d = dp(6)
+                Ellipse(pos=(self.x + dp(8), self.center_y - d / 2.0), size=(d, d))
+        self.canvas.after.clear()
+
+    def on_texture_size(self, *_):
+        pass
+
+
+class BadgeRow(StackLayout):
+    """Badges that wrap onto the next line when the phone is narrow."""
+
+    def __init__(self, **kw):
+        kw.setdefault("orientation", "lr-tb")
+        kw.setdefault("size_hint_y", None)
+        kw.setdefault("spacing", (dp(6), dp(6)))
+        super().__init__(**kw)
+        self.bind(minimum_height=self.setter("height"))
+
+
+class TickerCard(HudFrame):
+    """Label, price and change of one instrument, with a LIVE or NO DATA badge. Never shows a made-up number."""
+
+    def __init__(self, **kw):
+        kw.setdefault("padding", (dp(10), dp(8)))
+        kw.setdefault("spacing", dp(1))
+        super().__init__(**kw)
+        self.lbl_name = AutoLabel(text="", font_size=sp(10), color=P["muted"])
+        self.lbl_price = AutoLabel(text="", font_size=sp(16))
+        self.lbl_chg = AutoLabel(text="", font_size=sp(10))
+        for w in (self.lbl_name, self.lbl_price, self.lbl_chg):
+            self.add_widget(w)
+
+    def show(self, name, price_text, change_text, tone, badge):
+        """tone: 'up', 'down' or 'muted'. badge: short text such as LIVE or NO DATA."""
+        col = {"up": P["hx_up"], "down": P["hx_down"], "danger": P["hx_danger"], "amber": P["hx_amber"]}.get(
+            tone, P["hx_muted"])
+        self.lbl_name.text = esc(name)
+        self.lbl_price.text = "[b][color=%s]%s[/color][/b]" % (P["hx_text"] if tone in ("up", "down", "muted") else col,
+                                                              esc(price_text))
+        self.lbl_chg.text = "[color=%s]%s[/color]" % (col, esc(change_text if change_text else badge))
+
+
+class MetricTile(HudFrame):
+    """A big number with a small caption, for example RISK PER TRADE 1%."""
+
+    def __init__(self, caption, value, color, **kw):
+        kw.setdefault("padding", (dp(12), dp(8)))
+        kw.setdefault("spacing", dp(0))
+        super().__init__(**kw)
+        self.add_widget(AutoLabel(text=esc(caption), font_size=sp(10), color=P["muted"]))
+        self.lbl_value = AutoLabel(text="[b][color=%s]%s[/color][/b]" % (hex_of(color), esc(value)), font_size=sp(24))
+        self.add_widget(self.lbl_value)
+
+
+def notice(text, tone="amber"):
+    """The small coloured note box (HTML .notice): amber by default, red or green for states."""
+    col = {"amber": ("#f0ce8c", "#241d11", "#66502a"), "red": ("#ffb3bc", "#2a1519", "#70404a"),
+           "green": ("#9be8cc", "#0f2a22", "#28654f")}.get(tone, ("#f0ce8c", "#241d11", "#66502a"))
+    box = BoxLayout(orientation="vertical", size_hint_y=None, padding=dp(9))
+    lab = AutoLabel(text=esc(text), font_size=sp(11), color=rgba_of(col[0]))
+    box.add_widget(lab)
+    box.bind(minimum_height=box.setter("height"))
+
+    def draw(*_):
+        box.canvas.before.clear()
+        with box.canvas.before:
+            Color(*rgba_of(col[1]))
+            RoundedRectangle(pos=box.pos, size=box.size, radius=[dp(4)])
+            Color(*rgba_of(col[2]))
+            Line(rounded_rectangle=(box.x, box.y, box.width, box.height, dp(4)), width=1)
+    box.bind(pos=draw, size=draw)
+    box.label = lab
+    return box
+
+
+def hud_popup(**kw):
+    """A Popup with the dialog look: dark navy card, thin border rule, title in small capitals."""
+    kw.setdefault("background", "")
+    kw.setdefault("background_color", rgba_of("#0d1a2b"))
+    kw.setdefault("separator_color", rgba_of("#55728f"))
+    kw.setdefault("title_color", rgba_of("#e7f0fb"))
+    kw.setdefault("overlay_color", (0, 0, 0, 0.6))
+    if "title" in kw:
+        kw["title"] = str(kw["title"]).upper()
+    return Popup(**kw)
 
 
 # --------------------------------------------------------------------------- #
@@ -528,45 +731,23 @@ class MicButton(Widget):
     def _redraw(self, *_):
         self.canvas.clear()
         cx, cy = self.center_x, self.center_y
-        r = min(self.width, self.height) / 2.0 * 0.62
+        r = min(self.width, self.height) / 2.0 * 0.58
         phase = ANIM.phase
         st = self.state_name
         a1, a2 = P["a1"], P["a2"]
         main = a2 if st == "listening" else a1
         with self.canvas:
-            # soft glow discs
-            for k, alpha in ((1.55, 0.04), (1.3, 0.07), (1.12, 0.10)):
+            for k, alpha in ((1.5, 0.04), (1.3, 0.07), (1.14, 0.10)):
                 Color(main[0], main[1], main[2], alpha)
                 Line(circle=(cx, cy, r * k), width=dp(3.5))
-            # body
-            Color(P["panel"][0], P["panel"][1], P["panel"][2], 1)
-            RoundedRectangle(pos=(cx - r, cy - r), size=(2 * r, 2 * r), radius=[r])
-            Color(main[0], main[1], main[2], 0.9)
-            Line(circle=(cx, cy, r), width=dp(1.8))
-            # tick ring
-            tick_r1, tick_r2 = r * 1.12, r * 1.22
-            spin = (phase * 18.0) % 360.0 if st != "idle" else 0.0
-            for i in range(36):
-                ang = math.radians(i * 10.0 + spin)
-                long_tick = (i % 3 == 0)
-                r2 = tick_r2 + (r * 0.06 if long_tick else 0.0)
-                Color(a1[0], a1[1], a1[2], 0.85 if long_tick else 0.4)
-                Line(points=[cx + tick_r1 * math.sin(ang), cy + tick_r1 * math.cos(ang),
-                             cx + r2 * math.sin(ang), cy + r2 * math.cos(ang)], width=1.2)
-            # crosshair with a gap around the centre
-            gap, far = r * 0.78, r * 1.62
-            Color(a2[0], a2[1], a2[2], 0.9)
-            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-                Line(points=[cx + dx * gap, cy + dy * gap, cx + dx * far, cy + dy * far], width=dp(1.3))
-            # viewfinder brackets around the whole control
-            half = min(self.width, self.height) / 2.0 * 0.98
-            Color(a1[0], a1[1], a1[2], 0.9)
-            draw_brackets(cx - half, cy - half, 2 * half, 2 * half, dp(14), dp(2))
-            # state animation
+            Color(1, 1, 1, 1)
+            Ellipse(pos=(cx - r, cy - r), size=(2 * r, 2 * r), texture=vgrad(rgba_of("#132a42"), rgba_of("#0a1626")))
+            Color(*rgba_of("#2f80b7"))
+            Line(circle=(cx, cy, r), width=dp(1.4))
             if st == "idle":
                 pulse = 0.5 + 0.5 * math.sin(phase * 2.4)
-                Color(a1[0], a1[1], a1[2], 0.25 + 0.35 * pulse)
-                Line(circle=(cx, cy, r * (1.04 + 0.05 * pulse)), width=dp(1.2))
+                Color(main[0], main[1], main[2], 0.20 + 0.30 * pulse)
+                Line(circle=(cx, cy, r * (1.05 + 0.05 * pulse)), width=dp(1.2))
             elif st == "listening":
                 for k in range(3):
                     f = (phase * 0.9 + k / 3.0) % 1.0
@@ -575,8 +756,7 @@ class MicButton(Widget):
             else:
                 Color(a1[0], a1[1], a1[2], 0.95)
                 start = (phase * 260.0) % 360.0
-                Line(circle=(cx, cy, r * 1.06, start, start + 110), width=dp(2.4))
-            # microphone glyph
+                Line(circle=(cx, cy, r * 1.08, start, start + 110), width=dp(2.4))
             gw, gh = r * 0.34, r * 0.66
             Color(main[0], main[1], main[2], 1)
             RoundedRectangle(pos=(cx - gw / 2.0, cy - gh * 0.18), size=(gw, gh), radius=[gw / 2.0])
@@ -589,8 +769,8 @@ class MicButton(Widget):
 # Chart
 # --------------------------------------------------------------------------- #
 class HudChart(Widget):
-    """Live 1-minute candles with a camera-style overlay: crosshair on the last price, pulsing reticle,
-    edge ticks, corner brackets and a slow vertical scan line."""
+    """Live candles on a navy grid. A chip in the corner says LIVE or NO LIVE DATA. Only real candles are drawn:
+    with fewer than two candles the grid stays empty."""
     SHOWN = 60
 
     def __init__(self, height=260, **kw):
@@ -599,13 +779,15 @@ class HudChart(Widget):
         self.height = dp(height)
         self.candles = []
         self.levels = []
+        self.chip = ""                      # text of the corner chip; "" = chosen from the data
         self._geo = None
         self.bind(pos=self._draw, size=self._draw)
         ANIM.register(self)
 
-    def update(self, candles, levels=None):
+    def update(self, candles, levels=None, chip=""):
         self.candles = list(candles[-self.SHOWN:])
         self.levels = list(levels or [])
+        self.chip = str(chip or "")
         self._draw()
 
     def _scale(self):
@@ -618,86 +800,88 @@ class HudChart(Widget):
         span = (hi - lo) or 1.0
         return lo - span * 0.06, hi + span * 0.06
 
+    def _draw_chip(self, text, live):
+        tcol, edge = ("#00d68f", "#28654f") if live else ("#ffce70", "#6a552b")
+        bg = "#0f2a22" if live else "#1d1a10"
+        try:
+            lab = CoreLabel(text=text, font_size=sp(9.5), bold=True)
+            lab.refresh()
+            tex = lab.texture
+            tw, th = tex.size
+        except Exception:
+            return
+        x, y = self.x + dp(10), self.top - dp(10) - th - dp(8)
+        w, h = tw + dp(14), th + dp(8)
+        Color(*rgba_of(bg))
+        RoundedRectangle(pos=(x, y), size=(w, h), radius=[dp(3)])
+        Color(*rgba_of(edge))
+        Line(rounded_rectangle=(x, y, w, h, dp(3)), width=1)
+        Color(*rgba_of(tcol))
+        Rectangle(texture=tex, pos=(x + dp(7), y + dp(4)), size=(tw, th))
+
     def _draw(self, *_):
         self.canvas.clear()
         self._geo = None
         with self.canvas:
-            Color(P["bg"][0] + 0.008, P["bg"][1] + 0.012, P["bg"][2] + 0.02, 1)
-            Rectangle(pos=self.pos, size=self.size)
+            Color(1, 1, 1, 1)
+            RoundedRectangle(pos=self.pos, size=self.size, radius=[dp(5)],
+                             texture=vgrad(rgba_of("#071321"), rgba_of("#08101b")))
+            Color(*rgba_of("#23384f"))
+            gy = self.y + dp(24)
+            while gy < self.top:
+                Line(points=[self.x, gy, self.right, gy], width=1)
+                gy += dp(42)
+            gx = self.x + dp(50)
+            while gx < self.right:
+                Line(points=[gx, self.y, gx, self.top], width=1)
+                gx += dp(65)
             data = self.candles
-            if len(data) < 2 or self.width < 10 or self.height < 10:
-                return
-            lo, hi = self._scale()
-            span = hi - lo
+            if len(data) >= 2 and self.width >= 10 and self.height >= 10:
+                lo, hi = self._scale()
+                span = hi - lo
+                top_pad = dp(30)
 
-            def ypx(p):
-                return self.y + (p - lo) / span * self.height
+                def ypx(p):
+                    return self.y + dp(8) + (p - lo) / span * (self.height - top_pad - dp(8))
 
-            Color(P["a1"][0], P["a1"][1], P["a1"][2], 0.10)
-            for k in range(1, 5):
-                gy = self.y + self.height * k / 5.0
-                Line(points=[self.x, gy, self.x + self.width, gy], width=1)
-            pad = dp(6)
-            step = (self.width - 2 * pad - dp(26)) / float(len(data))
-            bw = max(1.0, step * 0.62)
-            for i, c in enumerate(data):
-                cx = self.x + pad + step * (i + 0.5)
-                Color(*(P["up"] if c.c >= c.o else P["down"]))
-                Line(points=[cx, ypx(c.l), cx, ypx(c.h)], width=1)
-                y1, y2 = ypx(min(c.o, c.c)), ypx(max(c.o, c.c))
-                Rectangle(pos=(cx - bw / 2.0, y1), size=(bw, max(1.0, y2 - y1)))
-            for price, col in self.levels:
-                if lo <= price <= hi:
-                    Color(col[0], col[1], col[2], 0.95)
-                    Line(points=[self.x, ypx(price), self.x + self.width, ypx(price)], width=dp(1.2), dash_length=dp(5),
-                         dash_offset=dp(4))
-            last = data[-1]
-            self._geo = (self.x + pad + step * (len(data) - 0.5), ypx(last.c))
-        self._draw_overlay(ANIM.phase)
-
-    def _draw_overlay(self, phase):
-        self.canvas.after.clear()
-        x, y, w, h = self.x, self.y, self.width, self.height
-        with self.canvas.after:
-            Color(P["a1"][0], P["a1"][1], P["a1"][2], 0.95)
-            draw_brackets(x + dp(2), y + dp(2), w - dp(4), h - dp(4), dp(18), dp(2))
-            Color(P["a2"][0], P["a2"][1], P["a2"][2], 0.9)
-            Line(points=[x + dp(2), y + h - dp(2), x + dp(46), y + h - dp(2)], width=dp(2))
-            for k in range(1, 20):
-                ty = y + h * k / 20.0
-                ln = dp(7) if k % 5 == 0 else dp(3.5)
-                Color(P["a1"][0], P["a1"][1], P["a1"][2], 0.55)
-                Line(points=[x + w - ln - dp(2), ty, x + w - dp(2), ty], width=1)
-            if ANIM.enabled:
-                sx = x + ((phase * 0.12) % 1.0) * w
-                Color(P["a1"][0], P["a1"][1], P["a1"][2], 0.10)
-                Line(points=[sx, y + dp(3), sx, y + h - dp(3)], width=dp(1.4))
-            if self._geo is not None:
-                gx, gy = self._geo
-                pulse = 0.5 + 0.5 * math.sin(phase * 4.0)
-                Color(P["a2"][0], P["a2"][1], P["a2"][2], 0.7)
-                Line(points=[x + dp(4), gy, gx - dp(14), gy], width=1, dash_length=dp(4), dash_offset=dp(4))
-                Line(points=[gx + dp(14), gy, x + w - dp(30), gy], width=1, dash_length=dp(4), dash_offset=dp(4))
-                Line(points=[gx, y + dp(4), gx, gy - dp(14)], width=1, dash_length=dp(4), dash_offset=dp(4))
-                Color(P["a2"][0], P["a2"][1], P["a2"][2], 0.5 + 0.5 * pulse)
-                Line(circle=(gx, gy, dp(8) + dp(4) * pulse), width=dp(1.5))
-                Color(1, 1, 1, 0.9)
-                Line(circle=(gx, gy, dp(2.2)), width=dp(1.5))
+                pad = dp(10)
+                step = (self.width - 2 * pad - dp(8)) / float(len(data))
+                bw = max(1.0, step * 0.62)
+                for i, c in enumerate(data):
+                    cx = self.x + pad + step * (i + 0.5)
+                    Color(*(rgba_of("#28c58b") if c.c >= c.o else rgba_of("#ef6675")))
+                    Line(points=[cx, ypx(c.l), cx, ypx(c.h)], width=1)
+                    y1, y2 = ypx(min(c.o, c.c)), ypx(max(c.o, c.c))
+                    Rectangle(pos=(cx - bw / 2.0, y1), size=(bw, max(1.0, y2 - y1)))
+                for price, col in self.levels:
+                    if lo <= price <= hi:
+                        Color(col[0], col[1], col[2], 0.95)
+                        Line(points=[self.x, ypx(price), self.right, ypx(price)], width=dp(1.1), dash_length=dp(5),
+                             dash_offset=dp(4))
+                last = data[-1]
+                self._geo = (self.x + pad + step * (len(data) - 0.5), ypx(last.c))
+                Color(*rgba_of("#e7f0fb", 0.9))
+                Ellipse(pos=(self._geo[0] - dp(2.5), self._geo[1] - dp(2.5)), size=(dp(5), dp(5)))
+            live = len(data) >= 2
+            self._draw_chip(self.chip or ("LIVE" if live else "NO LIVE DATA"), live and self.chip.upper() != "NO LIVE DATA")
+            Color(*rgba_of("#29425e"))
+            Line(rounded_rectangle=(self.x, self.y, self.width, self.height, dp(5)), width=1)
 
     def on_phase(self, phase):
-        self._draw_overlay(phase)
+        pass
 
 
 # --------------------------------------------------------------------------- #
 # Agent tile and status grid
 # --------------------------------------------------------------------------- #
 class AgentTile(ButtonBehavior, BoxLayout):
-    """One tappable agent. The border colour follows the agent's signal; the selected tile gets bright brackets."""
+    """One row of the agent list: status dot, name and job, state. The dot and the left edge follow the agent's
+    signal; the selected row is highlighted."""
 
     def __init__(self, name, **kw):
         kw.setdefault("orientation", "vertical")
         kw.setdefault("size_hint_y", None)
-        kw.setdefault("padding", (dp(10), dp(6)))
+        kw.setdefault("padding", (dp(26), dp(8), dp(8), dp(8)))
         super().__init__(**kw)
         self.agent = name
         self.edge = P["muted"]
@@ -718,15 +902,16 @@ class AgentTile(ButtonBehavior, BoxLayout):
         x, y, w, h = self.x, self.y, self.width, self.height
         e = self.edge
         with self.canvas.before:
-            Color(e[0], e[1], e[2], 0.22 if self.state == "down" else (0.12 if self.selected else 0.05))
+            Color(*rgba_of("#11263b" if (self.state == "down" or self.selected) else "#091421"))
             Rectangle(pos=(x, y), size=(w, h))
-            Color(e[0], e[1], e[2], 0.55)
-            Line(rectangle=(x, y, w, h), width=1)
-            Color(e[0], e[1], e[2], 1.0)
-            Line(points=[x, y, x, y + h], width=dp(3))
+            Color(*rgba_of("#20334a"))
+            Line(points=[x, y, x + w, y], width=1)
+            Color(e[0], e[1], e[2], 1)
+            d = dp(8)
+            Ellipse(pos=(x + dp(10), y + h / 2.0 - d / 2.0), size=(d, d))
             if self.selected:
-                Color(P["a2"][0], P["a2"][1], P["a2"][2], 1)
-                draw_brackets(x, y, w, h, dp(12), dp(2))
+                Color(*rgba_of("#2f80b7"))
+                Line(points=[x, y, x, y + h], width=dp(2))
 
 
 class StatusGrid(GridLayout):

@@ -38,7 +38,7 @@ from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.popup import Popup
 from kivy.uix.scrollview import ScrollView
 from kivy.uix.screenmanager import NoTransition, Screen, ScreenManager
-from kivy.uix.spinner import Spinner
+from kivy.uix.spinner import Spinner, SpinnerOption
 from kivy.uix.textinput import TextInput
 from kivy.uix.widget import Widget
 from kivy.utils import platform
@@ -79,9 +79,10 @@ def guess_module(text):
     return "APP"
 try:
     import ui_hud
-    from ui_hud import (ANIM, P, THEME_NAMES, THEMES, AgentTile, AutoLabel, HoldButton, HudButton, HudChart,
-                        HudFrame, HudNav, MicButton, PnlPanel, RISK_NOTE, StatusGrid, apply_theme, esc, heading,
-                        get_currency, hex_of, inr, px, set_currency, set_price_format)
+    from ui_hud import (ANIM, DEFAULT_THEME, P, THEME_NAMES, THEMES, AgentTile, AutoLabel, Badge, BadgeRow, HoldButton,
+                        HudButton, HudChart, HudFrame, HudNav, MetricTile, MicButton, PnlPanel, RISK_NOTE, StatusGrid,
+                        TickerCard, apply_theme, esc, heading, get_currency, hex_of, hud_popup, inr, notice, px, rgba_of,
+                        set_currency, set_price_format)
     from agents import (AGENT_NAMES, BUY, MIN_AGREE, SELL, ConsensusEngine, TrailingStop, copilot_report, fx,
                     set_price_dp)
     from broker import (AppLock, BrokerError, BrokerFeed, CredentialStore, IntegrityGuard, MarketStream, PaperBroker,
@@ -92,14 +93,15 @@ try:
     from agent_roster import ALL_NAMES, role_of, row_for as roster_row, rows as roster_rows
     from agent_talk import AgentTalk
     from budget import Budget, TIER_CHARTS, TIER_INFO, TIERS
-    from multi_scan import (market_verdict, report as multi_scan_report, scan as multi_scan_run, win_history)
+    from multi_scan import (CHARTS as MS_CHARTS, market_verdict, report as multi_scan_report, resample,
+                        scan as multi_scan_run, win_history)
     from patterns import analyze as pattern_analyze, paper_preview, report as pattern_report
     from market_flow import (FlowCollector, SIDE_CHOICES, bias_text, candle_bias, is_flow_request,
                              report as flow_report_text, side_allows, symbol_context)
     from forex import (FX_WATCHLIST, FxPaperBroker, NoTicks, OandaBroker, YahooFxFeed, fx_open, fx_slot, is_pair,
                        price_dp, session_text)
     from voice_forex import FxVoiceGate, parse_fx, readback
-    from risk_manager import PaperLearner, RiskManager
+    from risk_manager import DAILY_LOSS_LIMIT_PCT, MAX_RISK_PCT, PaperLearner, RiskManager
     from voice_engine import (DEFAULT_ELEVEN_VOICE, OPENAI_VOICES, PROFILES, ChatAI, ElevenLabsClient, OpenAIClient, OpenAIError,
                               VoiceEngine)
     from voice_mic import HELP_TEXT, VoiceMic, is_command, parse_command
@@ -179,6 +181,47 @@ def scroll_column(spacing=12):
     return sv, col
 
 
+class HudOption(SpinnerOption):
+    """One entry of an open drop-down list, in the dark navy look."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.background_normal = ""
+        self.background_down = ""
+        self.background_color = rgba_of("#101f31")
+        self.color = P["text"]
+        self.font_size = sp(13)
+        self.height = dp(44)
+
+
+def hud_spinner(text, values, height=44):
+    """Drop-down in the navy look: dark field, light text."""
+    return Spinner(text=text, values=tuple(values), size_hint_y=None, height=dp(height), font_size=sp(13),
+                   background_normal="", background_down="", background_color=rgba_of("#101f31"), color=P["text"],
+                   option_cls=HudOption)
+
+
+class Sections:
+    """CONFIG helper: title() starts a new card, every widget added afterwards goes into that card."""
+
+    def __init__(self, col):
+        self.col = col
+        self.cur = None
+
+    def begin(self, text):
+        self.cur = HudFrame()
+        self.cur.add_widget(heading(text))
+        self.col.add_widget(self.cur)
+
+    def add_widget(self, widget):
+        if self.cur is None:
+            self.begin("SETTINGS")
+        self.cur.add_widget(widget)
+
+
+TF_MINUTES = {"1m": 1, "3m": 3, "5m": 5, "15m": 15, "1h": 60, "1D": 30}
+
+
 class TDNApp(App):
     title = "Tactical Neural Matrix"
 
@@ -211,7 +254,7 @@ class TDNApp(App):
         os.makedirs(self.data_dir, exist_ok=True)
         load_env_files([os.path.join(self.data_dir, ".env"), os.path.join(os.getcwd(), ".env")])
         self.ui_path = os.path.join(self.data_dir, "ui.json")
-        self.ui = {"theme": "TIGER HUD", "feed": "AUTO", "symbol": WATCHLIST[0], "anim": True, "speak_errors": False,
+        self.ui = {"theme": DEFAULT_THEME, "feed": "AUTO", "symbol": WATCHLIST[0], "anim": True, "speak_errors": False,
                    "market": "NSE", "fx_symbol": FX_WATCHLIST[0], "side": "AUTO"}
         try:
             with open(self.ui_path, "r", encoding="utf-8") as fh:
@@ -224,7 +267,7 @@ class TDNApp(App):
         if self.ui["side"] not in SIDE_CHOICES:
             self.ui["side"] = "AUTO"
         if self.ui["theme"] not in THEMES:
-            self.ui["theme"] = "TIGER HUD"
+            self.ui["theme"] = DEFAULT_THEME
         if self.ui["symbol"] not in WATCHLIST:
             self.ui["symbol"] = WATCHLIST[0]
         if self.ui["fx_symbol"] not in FX_WATCHLIST:
@@ -342,6 +385,8 @@ class TDNApp(App):
         self.last_votes = None
         self.desk_agent = ALL_NAMES[0]
         self.desk_tab = "memoryLog"
+        self.chart_tf = "1m"                                     # chart timeframe: grouped from the real 1-minute candles
+        self.activity = []                                       # last status messages for SYSTEM ACTIVITY
         self.ticks.set_symbol(self.symbol)
         self.ticks.start()
         self.collector = FlowCollector(self.brain, self._scan_feed, lambda: list(self.watchlist), lambda: self.market,
@@ -556,25 +601,122 @@ class TDNApp(App):
                 self.status("Config refresh: %s" % str(exc)[:60])
 
     def _header(self):
-        box = HudFrame(accent=P["a2"], scan=True, padding=(dp(12), dp(8)), spacing=dp(2))
-        box.add_widget(AutoLabel(text="[b][color=%s]TACTICAL NEURAL MATRIX[/color][/b]  [color=%s]ADVANCED | TDN | %s LIVE DATA[/color]"
-                                 % (P["hx_a2"], P["hx_a1"], "FOREX" if self.market == "FX" else "NSE"), font_size=sp(14)))
-        self.grid = StatusGrid(["FEED", "PRICE", "MARKET", "SYSTEM", "MODE", "BROKER", "TICKS", "GUARD", "LOCK"], cols=3)
-        box.add_widget(self.grid)
+        """Brand line, subtitle and the four status badges (system, mode, live lock, feed)."""
+        box = HudFrame(padding=(dp(12), dp(8)), spacing=dp(3))
+        box.add_widget(AutoLabel(text="[b]Tactical Neural [color=%s]Matrix[/color][/b]  [size=%d][color=%s]v5.7.0 ADVANCED[/color][/size]"
+                                 % (P["hx_cyan"], int(sp(10)), P["hx_muted"]), font_size=sp(18)))
+        box.add_widget(AutoLabel(text="TRADING RESEARCH TERMINAL | %s | LIVE DATA ONLY" % (
+            "FOREX" if self.market == "FX" else "NSE"), font_size=sp(9.5), color=P["muted"]))
+        row = BadgeRow()
+        self.badge_sys = Badge("DISARMED", "green", dot=True)
+        self.badge_mode = Badge("PAPER MODE", "blue")
+        self.badge_live = Badge("LIVE LOCKED", "red")
+        self.badge_feed = Badge("NO LIVE DATA", "amber")
+        for b in (self.badge_sys, self.badge_mode, self.badge_live, self.badge_feed):
+            row.add_widget(b)
+        box.add_widget(row)
         return box
+
+    def _refresh_chrome(self, st):
+        """Badges, ticker cards, safety panel and activity list. Only real values; no data means NO LIVE DATA."""
+        problem = self._data_problem()
+        if self.tamper:
+            self.badge_sys.set("TAMPERED", "red")
+        elif st["killed"]:
+            self.badge_sys.set("DISARMED", "green")
+        elif st["locked"]:
+            self.badge_sys.set("LOCKED TODAY", "red")
+        elif self.mode == "PAPER":
+            self.badge_sys.set("PAPER ARMED", "amber")
+        else:
+            self.badge_sys.set("LIVE ARMED", "red")
+        self.badge_mode.set("LIVE MODE" if self.mode == "LIVE" else "PAPER MODE", "red" if self.mode == "LIVE" else "blue")
+        self.badge_live.set("LIVE UNLOCKED" if self.live_unlocked else "LIVE LOCKED", "amber" if self.live_unlocked else "red")
+        self.badge_feed.set(("%s LIVE" % self.source) if not problem else "NO LIVE DATA", "green" if not problem else "amber")
+        self.badge_chart.set("LIVE DATA" if not problem else "NO LIVE DATA", "green" if not problem else "amber")
+        # ticker cards: the active symbol, then the next two watchlist symbols from the last watchlist scan
+        wl = self.watchlist
+        i = wl.index(self.symbol) if self.symbol in wl else 0
+        names = [self.symbol, wl[(i + 1) % len(wl)], wl[(i + 2) % len(wl)]]
+        if problem or not self.candles:
+            self.tick_cards[0].show("%s | %s" % (self.symbol, self.source), "NO LIVE DATA", "", "amber", "NO DATA")
+        else:
+            first = self.candles[0].o
+            pct = (self.price - first) / first * 100.0 if first else 0.0
+            self.tick_cards[0].show("%s | %s" % (self.symbol, self.source), px(self.price),
+                                    "%+.2f%% on the chart" % pct, "up" if pct >= 0 else "down", "LIVE")
+        fresh = self.scan_time and time.time() - self.scan_time <= MAX_DATA_AGE
+        for card, name in zip(self.tick_cards[1:], names[1:]):
+            row = self.scan_rows.get(name) if fresh else None
+            cs = self.scan_candles.get(name) if fresh else None
+            if row is None or not cs or time.time() - cs[-1].t > MAX_DATA_AGE:
+                card.show(name, "NO LIVE DATA", "tap SCAN WATCHLIST", "amber", "NO DATA")
+            else:
+                pct = safe_float(row.get("day_pct"))
+                card.show("%s | scan" % name, px(cs[-1].c), "%+.2f%%" % pct, "up" if pct >= 0 else "down", "LIVE")
+        # safety panel
+        state = "DISARMED" if st["killed"] else ("LOCKED TODAY" if st["locked"] else "ARMED")
+        live_txt = "UNLOCKED" if self.live_unlocked else "LOCKED"
+        self.lbl_notice.text = esc("System is %s. Live execution is %s. Every order needs your CONFIRM." % (state, live_txt))
+        self.lbl_safety_line.text = "Safety state: [b][color=%s]%s[/color][/b]  |  [b][color=%s]LIVE %s[/color][/b]  |  [b][color=%s]%s[/color][/b]" % (
+            P["hx_ok"] if st["killed"] else P["hx_amber"], state, P["hx_danger"] if not self.live_unlocked else P["hx_amber"],
+            live_txt, P["hx_amber"] if problem else P["hx_ok"], "NO LIVE DATA" if problem else "DATA LIVE")
+        self.lbl_activity.text = esc("\n".join(self.activity) or "Terminal started. PAPER workspace, DISARMED, live locked.")
 
     # ---- HUD screen ----
     def _screen_hud(self):
         sv, col = scroll_column()
-        chart_box = HudFrame(accent=P["a1"], scan=True, padding=dp(8))
-        chart_box.add_widget(heading("LIVE 1-MINUTE CHART  |  %s" % ("FOREX" if self.market == "FX" else "NSE")))
+        row = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(86), spacing=dp(6))
+        self.tick_cards = [TickerCard(), TickerCard(), TickerCard()]
+        for c in self.tick_cards:
+            row.add_widget(c)
+        col.add_widget(row)
+        chart_box = HudFrame(padding=dp(10))
+        chart_box.add_widget(heading("MARKET OVERVIEW  |  %s" % ("FOREX" if self.market == "FX" else "NSE")))
+        brow = BadgeRow()
+        self.badge_chart = Badge("NO LIVE DATA", "amber")
+        brow.add_widget(self.badge_chart)
+        chart_box.add_widget(brow)
+        self.sp_symbol = hud_spinner(self.symbol, self.watchlist)
+        self.sp_symbol.bind(text=lambda inst, val: val != self.symbol and self.set_symbol(val))
+        chart_box.add_widget(self.sp_symbol)
+        tfrow = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(40), spacing=dp(4))
+        self.tf_buttons = {}
+        for tf in TF_MINUTES:
+            b = HudButton(text=tf, accent=P["a1"], filled=(tf == self.chart_tf), height=40)
+            b.bind(on_release=lambda inst, t=tf: self.set_chart_tf(t))
+            self.tf_buttons[tf] = b
+            tfrow.add_widget(b)
+        chart_box.add_widget(tfrow)
         self.chart = HudChart(height=250)
         chart_box.add_widget(self.chart)
         self.lbl_chart = AutoLabel(text="", font_size=sp(12), color=P["muted"])
         chart_box.add_widget(self.lbl_chart)
         self.lbl_candles = AutoLabel(text="", font_size=sp(12), color=P["muted"])
         chart_box.add_widget(self.lbl_candles)
+        chart_box.add_widget(AutoLabel(text="Candles are the real 1-minute candles of the live feed, grouped for the chosen "
+                                            "timeframe (1D = today in 30-minute candles). Without live data nothing is drawn.",
+                                       font_size=sp(10), color=P["muted"]))
         col.add_widget(chart_box)
+
+        rs = HudFrame()
+        rs.add_widget(heading("RISK & SAFETY"))
+        tiles = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(84), spacing=dp(8))
+        tiles.add_widget(MetricTile("RISK PER TRADE (MAX)", "%g%%" % MAX_RISK_PCT, P["ok"]))
+        tiles.add_widget(MetricTile("MAX LOSS PER DAY", "%g%%" % DAILY_LOSS_LIMIT_PCT, P["danger"]))
+        rs.add_widget(tiles)
+        self.notice_box = notice("", "amber")
+        self.lbl_notice = self.notice_box.label
+        rs.add_widget(self.notice_box)
+        self.lbl_safety_line = AutoLabel(text="", font_size=sp(11))
+        rs.add_widget(self.lbl_safety_line)
+        rs.add_widget(heading("SYSTEM STATUS"))
+        self.grid = StatusGrid(["FEED", "PRICE", "MARKET", "SYSTEM", "MODE", "BROKER", "TICKS", "GUARD", "LOCK"], cols=3)
+        rs.add_widget(self.grid)
+        rs.add_widget(heading("SYSTEM ACTIVITY"))
+        self.lbl_activity = AutoLabel(text="", font_size=sp(11), color=P["muted"])
+        rs.add_widget(self.lbl_activity)
+        col.add_widget(rs)
 
         # microphone, centred on the HUD
         mic_row = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(176))
@@ -677,6 +819,14 @@ class TDNApp(App):
     # ---- AGENTS screen ----
     def _screen_agents(self):
         sv, col = scroll_column(spacing=8)
+        top = HudFrame(padding=dp(10))
+        top.add_widget(heading("25-AGENT DESK"))
+        br = BadgeRow()
+        br.add_widget(Badge("20 VOTING", "blue"))
+        br.add_widget(Badge("5 SUPPORT (NO VOTE)", "amber"))
+        br.add_widget(Badge("%d%% AGREEMENT = %d OF 20" % (AGREE_PCT, MIN_AGREE), "green"))
+        top.add_widget(br)
+        col.add_widget(top)
         log = HudFrame(accent=P["a2"], scan=True)
         log.add_widget(heading("LIVE AGENT INSPECTOR  (tap any agent)", P["a2"]))
         self.lbl_agent_log = AutoLabel(text="Tap an agent below. It will speak and show exactly what it is "
@@ -700,9 +850,7 @@ class TDNApp(App):
         box.add_widget(heading("ADVANCED AGENT DESK  |  25 AGENTS (20 VOTING + 5 SUPPORT)"))
         self.lbl_roster = AutoLabel(text="", font_size=sp(11), color=P["muted"])
         box.add_widget(self.lbl_roster)
-        self.sp_desk = Spinner(text=self.desk_agent, values=tuple(ALL_NAMES), size_hint_y=None, height=dp(44),
-                               font_size=sp(13), background_normal="", background_color=P["a1"],
-                               color=(0.01, 0.01, 0.02, 1))
+        self.sp_desk = hud_spinner(self.desk_agent, tuple(ALL_NAMES))
         self.sp_desk.bind(text=lambda inst, val: self._desk_pick(val))
         box.add_widget(self.sp_desk)
         self.lbl_desk_head = AutoLabel(text="", font_size=sp(12))
@@ -818,11 +966,12 @@ class TDNApp(App):
 
     # ---- CONFIG screen ----
     def _screen_config(self):
-        sv, body = scroll_column(spacing=8)
+        sv, column = scroll_column(spacing=8)
+        body = Sections(column)
         store = self.store
 
         def title(t):
-            body.add_widget(heading(t))
+            body.begin(t)
 
         def field(hint, value="", password=False):
             ti = TextInput(text=value, hint_text=hint, multiline=False, password=password, font_size=sp(13),
@@ -832,8 +981,7 @@ class TDNApp(App):
             return ti
 
         def spinner(values, current, cb):
-            s = Spinner(text=current, values=tuple(values), size_hint_y=None, height=dp(44), font_size=sp(13),
-                        background_normal="", background_color=P["a1"], color=(0.01, 0.01, 0.02, 1))
+            s = hud_spinner(current, tuple(values))
             s.bind(text=lambda inst, val: cb(val))
             body.add_widget(s)
             return s
@@ -1512,6 +1660,10 @@ class TDNApp(App):
             lbl = getattr(self, "lbl_status", None)
             if lbl is not None:
                 lbl.text = esc(text)
+            if text:
+                acts = self.__dict__.setdefault("activity", [])
+                acts.insert(0, "%s  %s" % (time.strftime("%H:%M:%S"), text))
+                del acts[8:]
         Clock.schedule_once(apply, 0)
         if looks_like_error(text):                 # an error is never only a thin grey line at the bottom
             self.report_error(guess_module(text), text, spoken=spoken)
@@ -1574,8 +1726,8 @@ class TDNApp(App):
                         background_color=P["panel"], foreground_color=P["text"], cursor_color=P["a1"])
         content.add_widget(box)
         row = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(48), spacing=dp(8))
-        pop = Popup(title="ERROR LOG (keys and tokens are hidden)", content=content, size_hint=(0.96, 0.8),
-                    background="", background_color=P["bg"], separator_color=P["danger"])
+        pop = hud_popup(title="ERROR LOG (keys and tokens are hidden)", content=content, size_hint=(0.96, 0.8),
+                    separator_color=P["danger"])
 
         def copy():
             try:
@@ -1897,14 +2049,19 @@ class TDNApp(App):
             P["hx_danger"] if bias is None else P["hx_up"] if bias["bias"] == "GREEN"
             else P["hx_down"] if bias["bias"] == "RED" else P["hx_muted"], esc(bias_text(bias)))
 
+        self._refresh_chrome(st)
+        if self.sp_symbol.text != self.symbol:
+            self.sp_symbol.text = self.symbol
         if self.candles:
-            c = self.candles[-1]
-            self.chart.update(self.candles, self._levels())
+            shown = resample(self.candles, TF_MINUTES[self.chart_tf])
+            c = shown[-1]
             stale = self._data_problem()
+            self.chart.update(shown, self._levels(), "NO LIVE DATA" if stale else "LIVE %s" % self.chart_tf.upper())
             self.lbl_chart.text = (("[color=%s]%s[/color]  " % (P["hx_danger"], esc(stale)) if stale else "") +
-                                   fx("O %.2f  H %.2f  L %.2f  C %.2f  |  %d candles%s") % (
-                c.o, c.h, c.l, c.c, len(self.candles), ("  |  " + esc(self.note)) if self.note else ""))
+                                   fx("%s  O %.2f  H %.2f  L %.2f  C %.2f  |  %d candles%s") % (
+                self.chart_tf, c.o, c.h, c.l, c.c, len(shown), ("  |  " + esc(self.note)) if self.note else ""))
         else:
+            self.chart.update([], [], "NO LIVE DATA")
             self.lbl_chart.text = "[color=%s]NO LIVE DATA[/color]  Waiting for the broker or Yahoo feed. Nothing is simulated.  %s" % (
                 P["hx_danger"], esc(self.note))
         f = self.funds
@@ -2339,6 +2496,14 @@ class TDNApp(App):
             parts.append("No open position.")
         self.alert(" ".join(parts), True, True)
 
+    def set_chart_tf(self, tf):
+        if tf not in TF_MINUTES:
+            return
+        self.chart_tf = tf
+        for name, b in self.tf_buttons.items():
+            b.set_accent(P["a1"], filled=(name == tf))
+        self._refresh_all()
+
     def next_symbol(self):
         wl = self.watchlist
         i = wl.index(self.symbol) if self.symbol in wl else -1
@@ -2551,9 +2716,10 @@ class TDNApp(App):
             else "Filled at the live price with small slippage. No real money moves.")
         content.add_widget(AutoLabel(text=text, font_size=sp(14)))
         row = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(52), spacing=dp(8))
-        pop = Popup(title="CONFIRM LIVE ORDER" if live else "CONFIRM PAPER ORDER", content=content, size_hint=(0.94, None), height=dp(500),
-                    auto_dismiss=False, background="", background_color=P["bg"], separator_color=P["a2"])
-        yes = HudButton(text="CONFIRM " + side, accent=P["a2"], filled=True, height=52)
+        pop = hud_popup(title="CONFIRM LIVE ORDER" if live else "CONFIRM PAPER ORDER", content=content, size_hint=(0.94, None), height=dp(500),
+                    auto_dismiss=False, separator_color=P["danger"] if live else P["a1"])
+        yes = HudButton(text="CONFIRM " + side, accent=P["danger"] if live else (P["up"] if side == BUY else P["down"]),
+                        filled=True, height=52)
         yes.bind(on_release=lambda inst: (pop.dismiss(), self._start_order(d, risk_pct)))
         no = HudButton(text="CANCEL", accent=P["a1"], height=52)
         no.bind(on_release=lambda inst: pop.dismiss())
@@ -2644,8 +2810,8 @@ class TDNApp(App):
         content.add_widget(pin)
         content.add_widget(msg)
         row = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(52), spacing=dp(8))
-        pop = Popup(title=title, content=content, size_hint=(0.94, None), height=dp(330), auto_dismiss=False,
-                    background="", background_color=P["bg"], separator_color=P["a2"])
+        pop = hud_popup(title=title, content=content, size_hint=(0.94, None), height=dp(330), auto_dismiss=False,
+                    separator_color=P["a2"])
 
         def submit(*args):
             ok, why = self.applock.verify(pin.text)
@@ -2724,8 +2890,7 @@ class TDNApp(App):
         content.add_widget(sv)
         close = HudButton(text="CLOSE", accent=P["a1"], height=46)
         content.add_widget(close)
-        pop = Popup(title=title, content=content, size_hint=(0.94, 0.8), background="", background_color=P["bg"],
-                    separator_color=P["a2"])
+        pop = hud_popup(title=title, content=content, size_hint=(0.94, 0.8), separator_color=P["a2"])
         close.bind(on_release=lambda inst: pop.dismiss())
         pop.open()
 
@@ -2786,8 +2951,8 @@ class TDNApp(App):
                   "stop-loss, inside the 1 percent risk rule and after you press CONFIRM on the order popup.\n"
                   "Live orders lock again after one filled order.") % (P["hx_danger"], self.live_broker.name), font_size=sp(14)))
         row = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(52), spacing=dp(8))
-        pop = Popup(title="UNLOCK LIVE", content=content, size_hint=(0.94, None), height=dp(380), auto_dismiss=False,
-                    background="", background_color=P["bg"], separator_color=P["danger"])
+        pop = hud_popup(title="UNLOCK LIVE", content=content, size_hint=(0.94, None), height=dp(380), auto_dismiss=False,
+                    separator_color=P["danger"])
 
         def finish_unlock():
             self.live_unlocked = True
@@ -2920,8 +3085,8 @@ class TDNApp(App):
                                               P["hx_danger"], p["side"], p["qty"], esc(p["symbol"]), px(p["entry"])),
                                      font_size=sp(14)))
         row = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(52), spacing=dp(8))
-        pop = Popup(title="CONFIRM CLOSE", content=content, size_hint=(0.94, None), height=dp(300), auto_dismiss=False,
-                    background="", background_color=P["bg"], separator_color=P["a2"])
+        pop = hud_popup(title="CONFIRM CLOSE", content=content, size_hint=(0.94, None), height=dp(300), auto_dismiss=False,
+                    separator_color=P["a2"])
         yes = HudButton(text="CLOSE NOW", accent=P["danger"], filled=True, height=52)
         yes.bind(on_release=lambda inst: (pop.dismiss(), self._close_worker_start()))
         no = HudButton(text="CANCEL", accent=P["a1"], height=52)
@@ -3194,6 +3359,9 @@ class TDNApp(App):
         run = HudButton(text="RUN MULTI-CHART SCAN", accent=P["a1"], filled=True, height=48)
         run.bind(on_release=lambda inst: self.run_multi_scan())
         adv.add_widget(run)
+        self.ms_cards = BoxLayout(orientation="vertical", size_hint_y=None, spacing=dp(6))
+        self.ms_cards.bind(minimum_height=self.ms_cards.setter("height"))
+        adv.add_widget(self.ms_cards)
         self.lbl_ms = AutoLabel(text="Tap RUN MULTI-CHART SCAN.", font_size=sp(12))
         adv.add_widget(self.lbl_ms)
         col.add_widget(adv)
@@ -3222,10 +3390,36 @@ class TDNApp(App):
         self.set_scan_view(self.scan_view)
         return sv
 
+    def _ms_show(self, res):
+        """Visual result of the multi-chart scan: confluence tiles and one badge row per chart. Real values only."""
+        box = getattr(self, "ms_cards", None)
+        if box is None:
+            return
+        box.clear_widgets()
+        if not res:
+            box.height = 0
+            return
+        tiles = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(84), spacing=dp(8))
+        tone = P["up"] if res["direction"] == "BULLISH" else P["down"] if res["direction"] == "BEARISH" else P["amber"]
+        tiles.add_widget(MetricTile("CONFLUENCE", "%d%%" % res["confluence"], tone))
+        tiles.add_widget(MetricTile("DIRECTION", res["direction"], tone))
+        tiles.add_widget(MetricTile("CHARTS USED", "%d / %d" % (res["charts_used"], len(MS_CHARTS)), P["a1"]))
+        box.add_widget(tiles)
+        row = BadgeRow()
+        for r in res["rows"]:
+            v = r["view"]
+            if v:
+                row.add_widget(Badge("%s %s %+.2f" % (r["chart"], v["label"], v["score"]),
+                                     "green" if v["label"] == "BULLISH" else "red" if v["label"] == "BEARISH" else "amber"))
+            else:
+                row.add_widget(Badge("%s NO DATA" % r["chart"], "amber"))
+        box.add_widget(row)
+
     def run_multi_scan(self):
         """Multi-chart confluence + bullish and bearish pattern analysis + PAPER preview numbers. Read-only."""
         problem = self._data_problem()
         if problem or not self.candles:
+            self._ms_show(None)
             self.lbl_ms.text = "[color=%s]NO LIVE DATA[/color]  %s" % (P["hx_danger"], esc(problem or "No candles yet."))
             return
         allowed, why = self.budget.allow("scan")
@@ -3234,6 +3428,7 @@ class TDNApp(App):
             return
         res = multi_scan_run(self.candles, allowed=TIER_CHARTS[self.budget.tier])
         pat = pattern_analyze(self.candles)
+        self._ms_show(res)
         text = "%s %s\n%s\n\n%s" % (self.symbol, self.market, multi_scan_report(res), pattern_report(pat))
         d = self.engine.last_decision if self.decision_symbol_ok() else None
         try:
@@ -3270,12 +3465,9 @@ class TDNApp(App):
                                  foreground_color=P["text"], hint_text_color=P["muted"], cursor_color=P["a1"],
                                  padding=(dp(8), dp(12)))
         box.add_widget(self.in_note)
-        self.sp_mode = Spinner(text=MODES[0], values=MODES, size_hint_y=None, height=dp(44), font_size=sp(13),
-                               background_normal="", background_color=P["a1"], color=(0.01, 0.01, 0.02, 1))
-        self.sp_tone = Spinner(text=TONES[0], values=TONES, size_hint_y=None, height=dp(44), font_size=sp(13),
-                               background_normal="", background_color=P["a2"], color=(0.01, 0.01, 0.02, 1))
-        self.sp_lang = Spinner(text=LANGUAGES[0], values=LANGUAGES, size_hint_y=None, height=dp(44), font_size=sp(13),
-                               background_normal="", background_color=P["a1"], color=(0.01, 0.01, 0.02, 1))
+        self.sp_mode = hud_spinner(MODES[0], MODES)
+        self.sp_tone = hud_spinner(TONES[0], TONES)
+        self.sp_lang = hud_spinner(LANGUAGES[0], LANGUAGES)
         for w in (self.sp_mode, self.sp_tone, self.sp_lang):
             box.add_widget(w)
         gen = HudButton(text="WRITE THE REPLY", accent=P["a2"], filled=True, height=50)
